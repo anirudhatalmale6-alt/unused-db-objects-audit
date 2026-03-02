@@ -108,14 +108,6 @@ def _extract_cte_aliases(sql: str) -> set[str]:
         WITH RECURSIVE a AS (...) ...
     """
     aliases: set[str] = set()
-    # Match the WITH keyword (possibly WITH RECURSIVE) then capture comma-
-    # separated  alias AS (...)  blocks.
-    with_pat = re.compile(
-        r'\bWITH\s+(?:RECURSIVE\s+)?'
-        r'((?:["`]?(\w+)["`]?\s+AS\s*\()',  # first alias
-        re.IGNORECASE,
-    )
-    # Simpler: just grab every  <name> AS (  that follows WITH or a comma
     alias_pat = re.compile(r'[,\s]["`]?(\w+)["`]?\s+AS\s*\(', re.IGNORECASE)
     first_pat = re.compile(r'\bWITH\s+(?:RECURSIVE\s+)?["`]?(\w+)["`]?\s+AS\s*\(', re.IGNORECASE)
     for m in first_pat.finditer(sql):
