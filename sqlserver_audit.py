@@ -322,7 +322,7 @@ def fetch_query_store_refs(
     sql = """
         SELECT q.query_id,
                qt.query_sql_text,
-               MAX(rs.last_execution_time) AS last_exec
+               CAST(MAX(rs.last_execution_time) AS datetime2) AS last_exec
         FROM   sys.query_store_query q
         JOIN   sys.query_store_query_text qt
                ON q.query_text_id = qt.query_text_id
@@ -330,7 +330,7 @@ def fetch_query_store_refs(
                ON q.query_id = p.query_id
         JOIN   sys.query_store_runtime_stats rs
                ON p.plan_id = rs.plan_id
-        WHERE  rs.last_execution_time >= ?
+        WHERE  CAST(rs.last_execution_time AS datetime2) >= ?
         GROUP  BY q.query_id, qt.query_sql_text
     """
     cur = conn.cursor()
