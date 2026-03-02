@@ -37,10 +37,12 @@ import json
 import logging
 import re
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 import boto3
+from botocore.config import Config
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -292,6 +294,23 @@ def walk_indirect_refs(
     return resolved
 
 
+def _retry_on_throttle(func, *args, max_retries: int = 8, **kwargs):
+    """Call *func* with exponential backoff on ThrottlingException."""
+    for attempt in range(max_retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            if 'ThrottlingException' in str(exc) or 'Rate exceeded' in str(exc):
+                if attempt == max_retries:
+                    raise
+                wait = min(2 ** attempt + 0.5 * attempt, 60)
+                log.info("  Throttled — waiting %.1fs before retry %d/%d",
+                         wait, attempt + 1, max_retries)
+                time.sleep(wait)
+            else:
+                raise
+
+
 def fetch_query_executions(
     athena_client,
     workgroups: list[str],
@@ -300,6 +319,8 @@ def fetch_query_executions(
     """
     Return all SUCCEEDED query executions across the given *workgroups*
     whose completion time is >= *since*.
+
+    Uses exponential backoff to handle AWS API throttling.
     """
     all_results: list[dict] = []
 
@@ -309,16 +330,47 @@ def fetch_query_executions(
             paginator = athena_client.get_paginator('list_query_executions')
             for page in paginator.paginate(WorkGroup=wg):
                 execution_ids.extend(page.get('QueryExecutionIds', []))
+                # Pace pagination to avoid throttling
+                time.sleep(0.3)
         except Exception as exc:
-            log.warning("Could not list executions for workgroup '%s': %s", wg, exc)
-            continue
+            if 'ThrottlingException' in str(exc) or 'Rate exceeded' in str(exc):
+                log.warning("Throttled during listing for workgroup '%s'. "
+                            "Retrying with backoff...", wg)
+                # Retry the whole listing with manual pagination
+                execution_ids = []
+                next_token = None
+                while True:
+                    try:
+                        kwargs: dict = {'WorkGroup': wg, 'MaxResults': 50}
+                        if next_token:
+                            kwargs['NextToken'] = next_token
+                        resp = _retry_on_throttle(
+                            athena_client.list_query_executions, **kwargs)
+                        execution_ids.extend(resp.get('QueryExecutionIds', []))
+                        next_token = resp.get('NextToken')
+                        if not next_token:
+                            break
+                        time.sleep(0.5)
+                    except Exception as inner_exc:
+                        log.warning("Failed to list executions for workgroup '%s' "
+                                    "after retries: %s", wg, inner_exc)
+                        break
+            else:
+                log.warning("Could not list executions for workgroup '%s': %s", wg, exc)
+                continue
 
         log.info("Workgroup '%s': %d execution IDs found", wg, len(execution_ids))
 
         # BatchGetQueryExecution accepts max 50 at a time
         for i in range(0, len(execution_ids), 50):
             batch = execution_ids[i : i + 50]
-            resp = athena_client.batch_get_query_execution(QueryExecutionIds=batch)
+            try:
+                resp = _retry_on_throttle(
+                    athena_client.batch_get_query_execution,
+                    QueryExecutionIds=batch)
+            except Exception as exc:
+                log.warning("Failed to get batch %d-%d: %s", i, i + len(batch), exc)
+                continue
             for qe in resp.get('QueryExecutions', []):
                 status = qe.get('Status', {})
                 if status.get('State') != 'SUCCEEDED':
@@ -326,6 +378,8 @@ def fetch_query_executions(
                 completion = status.get('CompletionDateTime')
                 if completion and completion >= since:
                     all_results.append(qe)
+            # Pace batch calls
+            time.sleep(0.2)
 
     log.info("Total: %d succeeded executions within lookback window", len(all_results))
     return all_results
@@ -363,8 +417,12 @@ def analyse(
         session_kwargs['profile_name'] = profile
     session = boto3.Session(**session_kwargs)
 
-    glue = session.client('glue')
-    athena = session.client('athena')
+    # Adaptive retry mode handles throttling at the SDK level
+    retry_config = Config(
+        retries={'max_attempts': 10, 'mode': 'adaptive'}
+    )
+    glue = session.client('glue', config=retry_config)
+    athena = session.client('athena', config=retry_config)
 
     # 1. Catalog objects
     catalog = get_catalog_objects(glue, database)
