@@ -54,34 +54,52 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Presto view decoder
+# Presto / Trino view decoder
 # ---------------------------------------------------------------------------
 _PRESTO_VIEW_RE = re.compile(
     r'/\*\s*Presto\s+View\s*:\s*([A-Za-z0-9+/=\s]+)\*/', re.DOTALL
+)
+_TRINO_VIEW_RE = re.compile(
+    r'/\*\s*Trino\s+View\s*:\s*([A-Za-z0-9+/=\s]+)\*/', re.DOTALL
+)
+_CREATE_VIEW_RE = re.compile(
+    r'^\s*CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+\S+\s+AS\s+',
+    re.IGNORECASE | re.DOTALL,
 )
 
 
 def decode_presto_view(raw: str) -> str:
     """
-    Athena/Presto stores views in Glue's ViewOriginalText as either:
+    Athena/Presto/Trino stores views in Glue's ViewOriginalText as either:
       (a) plain SQL (CREATE VIEW ... AS SELECT ...)
       (b) a comment block: /* Presto View: <base64-json> */
+      (c) a comment block: /* Trino View: <base64-json> */
 
-    In case (b), the base64 decodes to JSON with an "originalSql" key.
-    This function extracts the usable SQL in both cases.
+    In case (b)/(c), the base64 decodes to JSON with an "originalSql" key.
+    This function extracts the usable SQL in all cases.
     """
     if not raw:
         return ''
-    m = _PRESTO_VIEW_RE.search(raw)
-    if m:
-        try:
-            b64 = m.group(1).replace('\n', '').replace('\r', '').strip()
-            decoded = base64.b64decode(b64).decode('utf-8')
-            obj = json.loads(decoded)
-            return obj.get('originalSql', '') or obj.get('sql', '') or decoded
-        except Exception as exc:
-            log.debug("Failed to decode Presto view blob: %s", exc)
-    return raw
+    # Try Presto format, then Trino format
+    for pattern in (_PRESTO_VIEW_RE, _TRINO_VIEW_RE):
+        m = pattern.search(raw)
+        if m:
+            try:
+                b64 = m.group(1).replace('\n', '').replace('\r', '').strip()
+                decoded = base64.b64decode(b64).decode('utf-8')
+                obj = json.loads(decoded)
+                sql = obj.get('originalSql', '') or obj.get('sql', '') or ''
+                if sql:
+                    log.debug("Decoded view SQL (%d chars) from base64 blob", len(sql))
+                    return sql
+                # Fall through if no SQL in JSON
+                return decoded
+            except Exception as exc:
+                log.warning("Failed to decode Presto/Trino view blob: %s", exc)
+                # Don't return raw — try stripping the comment and using remainder
+    # Strip CREATE VIEW ... AS prefix if present
+    result = _CREATE_VIEW_RE.sub('', raw).strip()
+    return result if result else raw
 
 
 # ---------------------------------------------------------------------------
@@ -216,12 +234,50 @@ def get_catalog_objects(glue_client, database: str) -> dict[str, str]:
 
 
 def get_view_sql(glue_client, database: str, view_name: str) -> str:
-    """Retrieve the usable SQL definition of a view from Glue."""
+    """
+    Retrieve the usable SQL definition of a view from Glue.
+    Tries multiple sources: ViewOriginalText, ViewExpandedText, and
+    Parameters dict (some Spark/Hive views store SQL there).
+    """
     try:
         resp = glue_client.get_table(DatabaseName=database, Name=view_name)
         tbl = resp['Table']
-        raw = tbl.get('ViewOriginalText') or tbl.get('ViewExpandedText') or ''
-        return decode_presto_view(raw)
+
+        # Source 1: ViewOriginalText (Presto/Trino base64 blob or plain SQL)
+        raw_original = tbl.get('ViewOriginalText', '') or ''
+        decoded_original = decode_presto_view(raw_original) if raw_original else ''
+
+        # Source 2: ViewExpandedText (fully resolved SQL, often has all refs)
+        raw_expanded = tbl.get('ViewExpandedText', '') or ''
+        decoded_expanded = decode_presto_view(raw_expanded) if raw_expanded else ''
+
+        # Source 3: Parameters dict (Spark/Hive sometimes store view SQL here)
+        params = tbl.get('Parameters', {}) or {}
+        param_sql = params.get('presto_view', '') or params.get('spark.sql.create.version', '')
+
+        # Use the longest decoded SQL — it's most likely the most complete
+        candidates = [
+            ('ViewOriginalText', decoded_original),
+            ('ViewExpandedText', decoded_expanded),
+            ('Parameters', param_sql),
+        ]
+        best_source, best_sql = max(candidates, key=lambda x: len(x[1]))
+
+        if not best_sql:
+            log.warning("No SQL found for view '%s' (ViewOriginalText=%d chars, "
+                        "ViewExpandedText=%d chars)",
+                        view_name, len(raw_original), len(raw_expanded))
+            return ''
+
+        log.debug("View '%s': using %s (%d chars)", view_name, best_source, len(best_sql))
+
+        # Return BOTH sources combined for maximum coverage — the parser
+        # deduplicates references anyway
+        combined = decoded_original
+        if decoded_expanded and decoded_expanded != decoded_original:
+            combined = combined + '\n' + decoded_expanded
+        return combined if combined.strip() else best_sql
+
     except Exception as exc:
         log.warning("Could not retrieve view SQL for '%s': %s", view_name, exc)
         return ''
@@ -249,9 +305,20 @@ def build_view_dependency_graph(
                 log.info("  VIEW %-40s  → (no SQL found)", vname)
             continue
 
+        # Primary: regex-based extraction
         all_refs = extract_referenced_objects(sql, target_database=database)
-        # Only keep refs that are actual catalog objects in this DB
         matched = all_refs & catalog_keys
+
+        # Fallback: substring scan for catalog objects that regex might miss
+        # (handles unusual SQL patterns, dynamic references, etc.)
+        sql_lower = _strip_noise(sql).lower()
+        for obj_name in catalog_keys:
+            if obj_name not in matched:
+                if re.search(r'\b' + re.escape(obj_name) + r'\b', sql_lower):
+                    matched.add(obj_name)
+                    if verbose:
+                        log.info("  VIEW %-40s  → fallback found: %s", vname, obj_name)
+
         # A view shouldn't list itself as a dependency
         matched.discard(vname)
         deps[vname] = matched
@@ -259,6 +326,9 @@ def build_view_dependency_graph(
         if verbose:
             log.info("  VIEW %-40s  → refs: %s", vname,
                      ', '.join(sorted(matched)) or '(none)')
+        elif not matched:
+            log.warning("  VIEW '%s' has no detected dependencies — "
+                        "possible parsing issue", vname)
 
     log.info("Built dependency graph for %d views", len(deps))
     return deps
