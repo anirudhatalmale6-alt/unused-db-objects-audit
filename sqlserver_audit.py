@@ -448,7 +448,40 @@ def analyse(
 
     log.info("Indirect references found for %d objects", len(indirect_refs))
 
-    # 5. Build CSV rows
+    # 5. Identify unused objects and compute drop order
+    unused_objects: set[str] = set()
+    for obj_name in catalog:
+        if obj_name not in direct_refs and obj_name not in indirect_refs:
+            unused_objects.add(obj_name)
+
+    # Build dependency sub-graph among unused objects only
+    unused_deps: dict[str, set[str]] = {}
+    for obj_name in unused_objects:
+        deps = deps_direct.get(obj_name, set())
+        unused_deps[obj_name] = deps & unused_objects
+
+    # Topological sort: leaf objects (depend on others, nothing depends on them)
+    # get order 1 (drop first). Base tables/root objects get highest order (drop last).
+    drop_order: dict[str, int] = {}
+
+    def _topo_depth(name: str, visited: set[str]) -> int:
+        if name in drop_order:
+            return drop_order[name]
+        if name in visited:
+            return 0  # cycle guard
+        visited.add(name)
+        dep_set = unused_deps.get(name, set())
+        if not dep_set:
+            drop_order[name] = 1
+            return 1
+        max_dep = max(_topo_depth(d, visited) for d in dep_set)
+        drop_order[name] = max_dep + 1
+        return max_dep + 1
+
+    for obj_name in unused_objects:
+        _topo_depth(obj_name, set())
+
+    # 6. Build CSV rows
     rows: list[dict] = []
     for obj_name in sorted(catalog):
         info = catalog[obj_name]
@@ -464,6 +497,7 @@ def analyse(
                 'last_reference_datetime': latest_dt.isoformat(),
                 'referencetype': 'direct',
                 'referencedBy': f"query_id:{qid}",
+                'drop_order': '',
                 'RemovalSql': '',
             })
         elif i_refs:
@@ -475,6 +509,7 @@ def analyse(
                 'last_reference_datetime': latest_dt.isoformat(),
                 'referencetype': 'indirect',
                 'referencedBy': via_obj,
+                'drop_order': '',
                 'RemovalSql': '',
             })
         else:
@@ -486,13 +521,14 @@ def analyse(
                 'last_reference_datetime': '',
                 'referencetype': '',
                 'referencedBy': '',
+                'drop_order': drop_order.get(obj_name, 1),
                 'RemovalSql': drop,
             })
 
-    # 6. Write CSV
+    # 7. Write CSV
     fieldnames = [
         'database', 'objectname', 'objecttype', 'last_reference_datetime',
-        'referencetype', 'referencedBy', 'RemovalSql',
+        'referencetype', 'referencedBy', 'drop_order', 'RemovalSql',
     ]
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

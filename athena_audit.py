@@ -439,14 +439,52 @@ def analyse(
 
     log.info("Indirect references found for %d objects via view chains", len(indirect_refs))
 
-    # 7. Build CSV rows
+    # 7. Identify unused objects and compute drop order
+    unused_objects: set[str] = set()
+    for obj_name in catalog:
+        if obj_name not in direct_refs and obj_name not in indirect_refs:
+            unused_objects.add(obj_name)
+
+    # Build dependency sub-graph among unused objects only
+    # (we only care about ordering drops for things we're actually dropping)
+    unused_deps: dict[str, set[str]] = {}
+    for obj_name in unused_objects:
+        deps = view_deps_direct.get(obj_name, set())
+        # Only keep deps that are also unused (and in this DB)
+        unused_deps[obj_name] = deps & unused_objects
+
+    # Topological sort: objects depended upon by others get HIGHER order
+    # (dropped last).  Leaf views/procs get order 1 (dropped first).
+    drop_order: dict[str, int] = {}
+
+    def _topo_depth(name: str, visited: set[str]) -> int:
+        if name in drop_order:
+            return drop_order[name]
+        if name in visited:
+            return 0  # cycle guard
+        visited.add(name)
+        deps = unused_deps.get(name, set())
+        if not deps:
+            drop_order[name] = 1
+            return 1
+        max_dep = max(_topo_depth(d, visited) for d in deps)
+        drop_order[name] = max_dep + 1
+        return max_dep + 1
+
+    for obj_name in unused_objects:
+        _topo_depth(obj_name, set())
+
+    # Invert so that the highest-depth objects (base tables) are dropped LAST
+    # drop_order 1 = drop first (child views), higher = drop later (parent tables)
+    # This is already correct: leaves=1, roots=highest
+
+    # 8. Build CSV rows
     rows: list[dict] = []
     for obj_name, obj_type in sorted(catalog.items()):
         d_refs = direct_refs.get(obj_name, [])
         i_refs = indirect_refs.get(obj_name, [])
 
         if d_refs:
-            # Latest direct reference
             latest_qeid, latest_dt = max(d_refs, key=lambda x: x[1])
             rows.append({
                 'database': database,
@@ -455,10 +493,10 @@ def analyse(
                 'last_reference_datetime': latest_dt.isoformat(),
                 'referencetype': 'direct',
                 'referencedBy': latest_qeid,
+                'drop_order': '',
                 'RemovalSql': '',
             })
         elif i_refs:
-            # Latest indirect reference
             via_view, latest_dt = max(i_refs, key=lambda x: x[1])
             rows.append({
                 'database': database,
@@ -467,13 +505,11 @@ def analyse(
                 'last_reference_datetime': latest_dt.isoformat(),
                 'referencetype': 'indirect',
                 'referencedBy': via_view,
+                'drop_order': '',
                 'RemovalSql': '',
             })
         else:
-            # Unused – safe to drop
             if obj_type == 'VIEW':
-                # Check if other views depend on this one — warn but still
-                # mark as droppable (the parent is also unused)
                 drop_sql = f'DROP VIEW IF EXISTS "{database}"."{obj_name}";'
             else:
                 drop_sql = f'DROP TABLE IF EXISTS "{database}"."{obj_name}";'
@@ -484,13 +520,14 @@ def analyse(
                 'last_reference_datetime': '',
                 'referencetype': '',
                 'referencedBy': '',
+                'drop_order': drop_order.get(obj_name, 1),
                 'RemovalSql': drop_sql,
             })
 
-    # 8. Write CSV
+    # 9. Write CSV — sort unused rows by drop_order so the file is execution-ready
     fieldnames = [
         'database', 'objectname', 'objecttype', 'last_reference_datetime',
-        'referencetype', 'referencedBy', 'RemovalSql',
+        'referencetype', 'referencedBy', 'drop_order', 'RemovalSql',
     ]
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
