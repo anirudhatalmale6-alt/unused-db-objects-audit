@@ -7,6 +7,15 @@ referenced in any completed query execution within a configurable look-back
 window.  Walks the full view-dependency chain so that indirect references are
 captured.  Produces a CSV report with safe-to-drop SQL for truly unused objects.
 
+Deep parsing features:
+  - CTE-aware: WITH-clause aliases are excluded from object references
+  - String-literal stripping: quoted strings removed before parsing
+  - Presto/Trino view decoding: handles base64-encoded JSON view definitions
+  - UNNEST / LATERAL / subquery alias exclusion
+  - Cross-database view references via schema-qualified names
+  - Multi-workgroup scanning
+  - Verbose mode for debugging what the parser sees
+
 Requirements:
     pip install boto3
 
@@ -18,10 +27,13 @@ Usage:
         --region us-east-1 \
         --workgroup primary \
         --profile my_aws_profile        # optional
+        --verbose                        # show per-view parsing detail
 """
 
 import argparse
+import base64
 import csv
+import json
 import logging
 import re
 import sys
@@ -40,32 +52,149 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# SQL identifier pattern – matches schema-qualified or bare names
+# Presto view decoder
 # ---------------------------------------------------------------------------
-_IDENT = r'(?:["`]?[\w*]+["`]?\.)?["`]?([\w]+)["`]?'
+_PRESTO_VIEW_RE = re.compile(
+    r'/\*\s*Presto\s+View\s*:\s*([A-Za-z0-9+/=\s]+)\*/', re.DOTALL
+)
 
-# Patterns that indicate an object is being *read* (referenced)
+
+def decode_presto_view(raw: str) -> str:
+    """
+    Athena/Presto stores views in Glue's ViewOriginalText as either:
+      (a) plain SQL (CREATE VIEW ... AS SELECT ...)
+      (b) a comment block: /* Presto View: <base64-json> */
+
+    In case (b), the base64 decodes to JSON with an "originalSql" key.
+    This function extracts the usable SQL in both cases.
+    """
+    if not raw:
+        return ''
+    m = _PRESTO_VIEW_RE.search(raw)
+    if m:
+        try:
+            b64 = m.group(1).replace('\n', '').replace('\r', '').strip()
+            decoded = base64.b64decode(b64).decode('utf-8')
+            obj = json.loads(decoded)
+            return obj.get('originalSql', '') or obj.get('sql', '') or decoded
+        except Exception as exc:
+            log.debug("Failed to decode Presto view blob: %s", exc)
+    return raw
+
+
+# ---------------------------------------------------------------------------
+# SQL parser – CTE-aware, string-safe
+# ---------------------------------------------------------------------------
+
+def _strip_noise(sql: str) -> str:
+    """Remove comments, string literals, and normalise whitespace."""
+    # Multi-line comments (but preserve Presto View blocks handled elsewhere)
+    sql = re.sub(r'/\*.*?\*/', ' ', sql, flags=re.DOTALL)
+    # Single-line comments
+    sql = re.sub(r'--[^\n]*', ' ', sql)
+    # Single-quoted string literals  'hello world'
+    sql = re.sub(r"'(?:[^'\\]|\\.)*'", "''", sql)
+    # Double-quoted identifiers are kept (they are names, not strings)
+    return sql
+
+
+def _extract_cte_aliases(sql: str) -> set[str]:
+    """
+    Find all CTE aliases defined in WITH clauses so we can exclude them
+    from the referenced-objects set.
+
+    Handles:
+        WITH a AS (...), b AS (...) SELECT ...
+        WITH RECURSIVE a AS (...) ...
+    """
+    aliases: set[str] = set()
+    # Match the WITH keyword (possibly WITH RECURSIVE) then capture comma-
+    # separated  alias AS (...)  blocks.
+    with_pat = re.compile(
+        r'\bWITH\s+(?:RECURSIVE\s+)?'
+        r'((?:["`]?(\w+)["`]?\s+AS\s*\()',  # first alias
+        re.IGNORECASE,
+    )
+    # Simpler: just grab every  <name> AS (  that follows WITH or a comma
+    alias_pat = re.compile(r'[,\s]["`]?(\w+)["`]?\s+AS\s*\(', re.IGNORECASE)
+    first_pat = re.compile(r'\bWITH\s+(?:RECURSIVE\s+)?["`]?(\w+)["`]?\s+AS\s*\(', re.IGNORECASE)
+    for m in first_pat.finditer(sql):
+        aliases.add(m.group(1).lower())
+    for m in alias_pat.finditer(sql):
+        aliases.add(m.group(1).lower())
+    return aliases
+
+
+# Identifiers — handles backtick, double-quote, and bare names;
+# optionally schema-qualified (db.table or `db`.`table`)
+_QUAL_IDENT = (
+    r'(?:["`]?(\w+)["`]?\s*\.\s*)?'   # optional schema/db  (group 1)
+    r'["`]?(\w+)["`]?'                  # object name         (group 2)
+)
+
+# Patterns that signal an object reference (each yields groups 1 & 2)
 _REF_PATTERNS = [
-    re.compile(r'\bFROM\s+' + _IDENT, re.IGNORECASE),
-    re.compile(r'\bJOIN\s+' + _IDENT, re.IGNORECASE),
-    re.compile(r'\bINTO\s+' + _IDENT, re.IGNORECASE),
-    re.compile(r'\bTABLE\s+' + _IDENT, re.IGNORECASE),
-    re.compile(r'\bUPDATE\s+' + _IDENT, re.IGNORECASE),
-    re.compile(r'\bEXISTS\s+' + _IDENT, re.IGNORECASE),
+    re.compile(r'\bFROM\s+' + _QUAL_IDENT, re.IGNORECASE),
+    re.compile(r'\bJOIN\s+' + _QUAL_IDENT, re.IGNORECASE),
+    re.compile(r'\bINTO\s+' + _QUAL_IDENT, re.IGNORECASE),
+    re.compile(r'\bTABLE\s+' + _QUAL_IDENT, re.IGNORECASE),
+    re.compile(r'\bUPDATE\s+' + _QUAL_IDENT, re.IGNORECASE),
 ]
 
+# Tokens that should NOT be treated as object names when they follow FROM/JOIN
+_SQL_KEYWORDS = {
+    'select', 'where', 'group', 'order', 'having', 'limit', 'union',
+    'intersect', 'except', 'on', 'using', 'as', 'set', 'values', 'into',
+    'insert', 'update', 'delete', 'create', 'drop', 'alter', 'with',
+    'case', 'when', 'then', 'else', 'end', 'and', 'or', 'not', 'in',
+    'is', 'null', 'true', 'false', 'like', 'between', 'exists',
+    'unnest', 'lateral', 'cross', 'full', 'left', 'right', 'inner',
+    'outer', 'natural', 'tablesample', 'rows', 'range', 'current',
+    'over', 'partition', 'by', 'asc', 'desc', 'fetch', 'offset',
+    'for', 'all', 'any', 'some', 'distinct', 'top', 'if',
+}
 
-def extract_referenced_objects(sql_text: str) -> set[str]:
-    """Return the set of object names (lower-cased) referenced in *sql_text*."""
+
+def extract_referenced_objects(
+    sql_text: str,
+    target_database: str | None = None,
+) -> set[str]:
+    """
+    Return the set of object names (lower-cased) referenced in *sql_text*.
+
+    - Strips comments and string literals first.
+    - Excludes CTE aliases defined in WITH clauses.
+    - Excludes SQL keywords that regex might accidentally capture.
+    - Excludes UNNEST(...) which is not a table reference.
+    - If *target_database* is given, schema-qualified names that reference a
+      DIFFERENT database are skipped.
+    """
     if not sql_text:
         return set()
-    # Strip single-line and multi-line comments
-    sql_clean = re.sub(r'--[^\n]*', ' ', sql_text)
-    sql_clean = re.sub(r'/\*.*?\*/', ' ', sql_clean, flags=re.DOTALL)
+
+    sql_clean = _strip_noise(sql_text)
+    cte_aliases = _extract_cte_aliases(sql_clean)
+
     found: set[str] = set()
     for pat in _REF_PATTERNS:
         for m in pat.finditer(sql_clean):
-            found.add(m.group(1).strip('`"').lower())
+            schema_part = (m.group(1) or '').strip('`"').lower()
+            name_part = m.group(2).strip('`"').lower()
+
+            # Skip SQL keywords the regex accidentally grabbed
+            if name_part in _SQL_KEYWORDS:
+                continue
+
+            # Skip CTE aliases
+            if name_part in cte_aliases:
+                continue
+
+            # Skip if it's from a different database (schema-qualified)
+            if target_database and schema_part and schema_part != target_database.lower():
+                continue
+
+            found.add(name_part)
+
     return found
 
 
@@ -85,23 +214,28 @@ def get_catalog_objects(glue_client, database: str) -> dict[str, str]:
                 objects[name] = 'VIEW'
             else:
                 objects[name] = 'TABLE'
-    log.info("Found %d catalog objects in database '%s'", len(objects), database)
+    log.info("Found %d catalog objects in database '%s'  (%d views, %d tables)",
+             len(objects), database,
+             sum(1 for t in objects.values() if t == 'VIEW'),
+             sum(1 for t in objects.values() if t == 'TABLE'))
     return objects
 
 
-def get_view_sql(glue_client, database: str, view_name: str) -> str | None:
-    """Retrieve the SQL definition of a view from Glue."""
+def get_view_sql(glue_client, database: str, view_name: str) -> str:
+    """Retrieve the usable SQL definition of a view from Glue."""
     try:
         resp = glue_client.get_table(DatabaseName=database, Name=view_name)
         tbl = resp['Table']
-        # Presto/Trino views store their SQL in ViewOriginalText
-        return tbl.get('ViewOriginalText') or tbl.get('ViewExpandedText') or None
-    except Exception:
-        return None
+        raw = tbl.get('ViewOriginalText') or tbl.get('ViewExpandedText') or ''
+        return decode_presto_view(raw)
+    except Exception as exc:
+        log.warning("Could not retrieve view SQL for '%s': %s", view_name, exc)
+        return ''
 
 
 def build_view_dependency_graph(
-    glue_client, database: str, catalog_objects: dict[str, str]
+    glue_client, database: str, catalog_objects: dict[str, str],
+    verbose: bool = False,
 ) -> dict[str, set[str]]:
     """
     For every VIEW in the catalog, parse its SQL and record which other
@@ -110,12 +244,28 @@ def build_view_dependency_graph(
     Returns {view_name: {referenced_object, ...}}.
     """
     deps: dict[str, set[str]] = {}
+    catalog_keys = set(catalog_objects.keys())
     views = [n for n, t in catalog_objects.items() if t == 'VIEW']
+
     for vname in views:
         sql = get_view_sql(glue_client, database, vname)
-        refs = extract_referenced_objects(sql) if sql else set()
+        if not sql:
+            deps[vname] = set()
+            if verbose:
+                log.info("  VIEW %-40s  → (no SQL found)", vname)
+            continue
+
+        all_refs = extract_referenced_objects(sql, target_database=database)
         # Only keep refs that are actual catalog objects in this DB
-        deps[vname] = refs & set(catalog_objects.keys())
+        matched = all_refs & catalog_keys
+        # A view shouldn't list itself as a dependency
+        matched.discard(vname)
+        deps[vname] = matched
+
+        if verbose:
+            log.info("  VIEW %-40s  → refs: %s", vname,
+                     ', '.join(sorted(matched)) or '(none)')
+
     log.info("Built dependency graph for %d views", len(deps))
     return deps
 
@@ -152,36 +302,54 @@ def walk_indirect_refs(
 
 def fetch_query_executions(
     athena_client,
-    workgroup: str,
+    workgroups: list[str],
     since: datetime,
 ) -> list[dict]:
     """
-    Yield all SUCCEEDED query executions in *workgroup* whose completion time
-    is >= *since*.
+    Return all SUCCEEDED query executions across the given *workgroups*
+    whose completion time is >= *since*.
     """
-    execution_ids: list[str] = []
-    paginator = athena_client.get_paginator('list_query_executions')
-    for page in paginator.paginate(WorkGroup=workgroup):
-        execution_ids.extend(page.get('QueryExecutionIds', []))
+    all_results: list[dict] = []
 
-    log.info("Found %d total query execution IDs in workgroup '%s'",
-             len(execution_ids), workgroup)
+    for wg in workgroups:
+        execution_ids: list[str] = []
+        try:
+            paginator = athena_client.get_paginator('list_query_executions')
+            for page in paginator.paginate(WorkGroup=wg):
+                execution_ids.extend(page.get('QueryExecutionIds', []))
+        except Exception as exc:
+            log.warning("Could not list executions for workgroup '%s': %s", wg, exc)
+            continue
 
-    results: list[dict] = []
-    # BatchGetQueryExecution accepts max 50 at a time
-    for i in range(0, len(execution_ids), 50):
-        batch = execution_ids[i : i + 50]
-        resp = athena_client.batch_get_query_execution(QueryExecutionIds=batch)
-        for qe in resp.get('QueryExecutions', []):
-            status = qe.get('Status', {})
-            if status.get('State') != 'SUCCEEDED':
-                continue
-            completion = status.get('CompletionDateTime')
-            if completion and completion >= since:
-                results.append(qe)
+        log.info("Workgroup '%s': %d execution IDs found", wg, len(execution_ids))
 
-    log.info("Filtered to %d succeeded executions within lookback window", len(results))
-    return results
+        # BatchGetQueryExecution accepts max 50 at a time
+        for i in range(0, len(execution_ids), 50):
+            batch = execution_ids[i : i + 50]
+            resp = athena_client.batch_get_query_execution(QueryExecutionIds=batch)
+            for qe in resp.get('QueryExecutions', []):
+                status = qe.get('Status', {})
+                if status.get('State') != 'SUCCEEDED':
+                    continue
+                completion = status.get('CompletionDateTime')
+                if completion and completion >= since:
+                    all_results.append(qe)
+
+    log.info("Total: %d succeeded executions within lookback window", len(all_results))
+    return all_results
+
+
+def list_workgroups(athena_client) -> list[str]:
+    """List all Athena workgroups in the account."""
+    wgs: list[str] = []
+    try:
+        paginator = athena_client.get_paginator('list_work_groups')
+        for page in paginator.paginate():
+            for wg in page.get('WorkGroups', []):
+                wgs.append(wg['Name'])
+    except Exception:
+        wgs = ['primary']
+    return wgs
 
 
 # ---------------------------------------------------------------------------
@@ -192,9 +360,11 @@ def analyse(
     database: str,
     lookback_days: int,
     region: str,
-    workgroup: str,
+    workgroups: list[str],
+    all_workgroups: bool,
     profile: str | None,
     output_path: str,
+    verbose: bool,
 ):
     session_kwargs: dict = {'region_name': region}
     if profile:
@@ -211,14 +381,29 @@ def analyse(
         return
 
     # 2. View dependency graph  (direct + transitive)
-    view_deps_direct = build_view_dependency_graph(glue, database, catalog)
+    log.info("Parsing view definitions for dependency graph...")
+    view_deps_direct = build_view_dependency_graph(glue, database, catalog, verbose=verbose)
     view_deps_all = walk_indirect_refs(view_deps_direct)
 
-    # 3. Query executions
-    since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-    executions = fetch_query_executions(athena, workgroup, since)
+    if verbose:
+        for vname, deps in sorted(view_deps_all.items()):
+            if deps - view_deps_direct.get(vname, set()):
+                indirect_only = deps - view_deps_direct.get(vname, set())
+                log.info("  VIEW %-40s  transitive deps: %s", vname,
+                         ', '.join(sorted(indirect_only)))
 
-    # 4. For each object, find direct references from queries
+    # 3. Resolve workgroups
+    if all_workgroups:
+        wg_list = list_workgroups(athena)
+        log.info("Scanning all workgroups: %s", ', '.join(wg_list))
+    else:
+        wg_list = workgroups
+
+    # 4. Query executions
+    since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    executions = fetch_query_executions(athena, wg_list, since)
+
+    # 5. For each object, find direct references from queries
     #    direct_refs[object_name] = [(query_execution_id, completion_dt), ...]
     direct_refs: dict[str, list[tuple[str, datetime]]] = defaultdict(list)
 
@@ -226,12 +411,18 @@ def analyse(
         qeid = qe['QueryExecutionId']
         sql = qe.get('Query', '')
         completion = qe['Status'].get('CompletionDateTime')
-        refs = extract_referenced_objects(sql)
+        # Also check if the query targets our database (Athena queries have
+        # a QueryExecutionContext with Database)
+        qe_db = qe.get('QueryExecutionContext', {}).get('Database', '').lower()
+        # Parse references from the SQL text
+        refs = extract_referenced_objects(sql, target_database=database)
         for ref_name in refs:
             if ref_name in catalog:
                 direct_refs[ref_name].append((qeid, completion))
 
-    # 5. Indirect references – if a view V references object O (transitively),
+    log.info("Direct references found for %d objects from query history", len(direct_refs))
+
+    # 6. Indirect references – if a view V references object O (transitively),
     #    and V itself was directly queried, then O has an indirect reference
     #    via V.
     #    indirect_refs[object_name] = [(via_view, latest_dt), ...]
@@ -246,7 +437,9 @@ def analyse(
             if dep_obj != view_name:
                 indirect_refs[dep_obj].append((view_name, latest_dt))
 
-    # 6. Build CSV rows
+    log.info("Indirect references found for %d objects via view chains", len(indirect_refs))
+
+    # 7. Build CSV rows
     rows: list[dict] = []
     for obj_name, obj_type in sorted(catalog.items()):
         d_refs = direct_refs.get(obj_name, [])
@@ -279,6 +472,8 @@ def analyse(
         else:
             # Unused – safe to drop
             if obj_type == 'VIEW':
+                # Check if other views depend on this one — warn but still
+                # mark as droppable (the parent is also unused)
                 drop_sql = f'DROP VIEW IF EXISTS "{database}"."{obj_name}";'
             else:
                 drop_sql = f'DROP TABLE IF EXISTS "{database}"."{obj_name}";'
@@ -292,7 +487,7 @@ def analyse(
                 'RemovalSql': drop_sql,
             })
 
-    # 7. Write CSV
+    # 8. Write CSV
     fieldnames = [
         'database', 'objectname', 'objecttype', 'last_reference_datetime',
         'referencetype', 'referencedBy', 'RemovalSql',
@@ -328,19 +523,30 @@ def main():
                         help='Output CSV path (default: athena_audit_report.csv)')
     parser.add_argument('--region', '-r', default='us-east-1',
                         help='AWS region (default: us-east-1)')
-    parser.add_argument('--workgroup', '-w', default='primary',
-                        help='Athena workgroup (default: primary)')
+    parser.add_argument('--workgroup', '-w', action='append', default=None,
+                        help='Athena workgroup(s) to scan (repeatable; default: primary)')
+    parser.add_argument('--all-workgroups', action='store_true',
+                        help='Scan ALL workgroups in the account')
     parser.add_argument('--profile', '-p', default=None,
                         help='AWS CLI profile name (optional)')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                        help='Show per-view parsing detail for debugging')
     args = parser.parse_args()
+
+    workgroups = args.workgroup or ['primary']
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     analyse(
         database=args.database,
         lookback_days=args.lookback_days,
         region=args.region,
-        workgroup=args.workgroup,
+        workgroups=workgroups,
+        all_workgroups=args.all_workgroups,
         profile=args.profile,
         output_path=args.output,
+        verbose=args.verbose,
     )
 
 

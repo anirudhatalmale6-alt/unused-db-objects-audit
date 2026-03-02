@@ -8,6 +8,15 @@ configurable look-back window.  Walks the dependency chain via
 sys.sql_expression_dependencies to capture indirect references.  Produces a CSV
 report with safe-to-drop SQL for truly unused objects.
 
+Deep parsing features:
+  - CTE-aware: WITH-clause aliases excluded from reference set
+  - String-literal stripping: quoted strings removed before parsing
+  - Temp table exclusion (#tmp, ##global)
+  - sys.sql_expression_dependencies for server-side dependency graph (reliable)
+  - Query Store text parsing as secondary confirmation
+  - Trigger parent-table awareness (trigger references its parent table)
+  - Verbose mode for debugging
+
 Requirements:
     pip install pyodbc
 
@@ -20,6 +29,7 @@ Usage:
         --lookback-days 90 \
         --output report.csv \
         --driver "ODBC Driver 18 for SQL Server"  # optional
+        --verbose
 """
 
 import argparse
@@ -44,7 +54,6 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Object types we care about
 # ---------------------------------------------------------------------------
-# sys.objects type codes → human-readable labels
 OBJECT_TYPE_MAP = {
     'U':  'TABLE',
     'V':  'VIEW',
@@ -57,30 +66,89 @@ OBJECT_TYPE_MAP = {
     'SQ': 'SERVICE QUEUE',
 }
 
-# SQL identifier pattern (may be schema-qualified)
-_IDENT = r'(?:\[?[\w]+\]?\.)*\[?([\w]+)\]?'
+# ---------------------------------------------------------------------------
+# SQL parser – CTE-aware, string-safe
+# ---------------------------------------------------------------------------
+
+def _strip_noise(sql: str) -> str:
+    """Remove comments, string literals, and normalise whitespace."""
+    sql = re.sub(r'/\*.*?\*/', ' ', sql, flags=re.DOTALL)
+    sql = re.sub(r'--[^\n]*', ' ', sql)
+    # Single-quoted strings
+    sql = re.sub(r"'(?:[^'\\]|\\.)*'", "''", sql)
+    # N'unicode strings'
+    sql = re.sub(r"N'(?:[^'\\]|\\.)*'", "''", sql)
+    return sql
+
+
+def _extract_cte_aliases(sql: str) -> set[str]:
+    """Extract CTE alias names from WITH clauses."""
+    aliases: set[str] = set()
+    first_pat = re.compile(
+        r'\bWITH\s+(?:RECURSIVE\s+)?\[?(\w+)\]?\s+AS\s*\(', re.IGNORECASE)
+    alias_pat = re.compile(r',\s*\[?(\w+)\]?\s+AS\s*\(', re.IGNORECASE)
+    for m in first_pat.finditer(sql):
+        aliases.add(m.group(1).lower())
+    for m in alias_pat.finditer(sql):
+        aliases.add(m.group(1).lower())
+    return aliases
+
+
+_QUAL_IDENT = (
+    r'(?:\[?(\w+)\]?\s*\.\s*)?'   # optional schema  (group 1)
+    r'\[?(\w+)\]?'                  # object name      (group 2)
+)
 
 _REF_PATTERNS = [
-    re.compile(r'\bFROM\s+' + _IDENT, re.IGNORECASE),
-    re.compile(r'\bJOIN\s+' + _IDENT, re.IGNORECASE),
-    re.compile(r'\bINTO\s+' + _IDENT, re.IGNORECASE),
-    re.compile(r'\bUPDATE\s+' + _IDENT, re.IGNORECASE),
-    re.compile(r'\bEXEC(?:UTE)?\s+' + _IDENT, re.IGNORECASE),
-    re.compile(r'\bTABLE\s+' + _IDENT, re.IGNORECASE),
-    re.compile(r'\bEXISTS\s+' + _IDENT, re.IGNORECASE),
+    re.compile(r'\bFROM\s+' + _QUAL_IDENT, re.IGNORECASE),
+    re.compile(r'\bJOIN\s+' + _QUAL_IDENT, re.IGNORECASE),
+    re.compile(r'\bINTO\s+' + _QUAL_IDENT, re.IGNORECASE),
+    re.compile(r'\bUPDATE\s+' + _QUAL_IDENT, re.IGNORECASE),
+    re.compile(r'\bEXEC(?:UTE)?\s+' + _QUAL_IDENT, re.IGNORECASE),
+    re.compile(r'\bTABLE\s+' + _QUAL_IDENT, re.IGNORECASE),
+    re.compile(r'\bMERGE\s+(?:INTO\s+)?' + _QUAL_IDENT, re.IGNORECASE),
+    re.compile(r'\bTRUNCATE\s+TABLE\s+' + _QUAL_IDENT, re.IGNORECASE),
+    re.compile(r'\bINSERT\s+(?:INTO\s+)?' + _QUAL_IDENT, re.IGNORECASE),
+    re.compile(r'\bDELETE\s+(?:FROM\s+)?' + _QUAL_IDENT, re.IGNORECASE),
 ]
+
+_SQL_KEYWORDS = {
+    'select', 'where', 'group', 'order', 'having', 'limit', 'union',
+    'intersect', 'except', 'on', 'using', 'as', 'set', 'values', 'into',
+    'insert', 'update', 'delete', 'create', 'drop', 'alter', 'with',
+    'case', 'when', 'then', 'else', 'end', 'and', 'or', 'not', 'in',
+    'is', 'null', 'true', 'false', 'like', 'between', 'exists',
+    'cross', 'full', 'left', 'right', 'inner', 'outer', 'natural',
+    'top', 'distinct', 'all', 'any', 'some', 'if', 'begin', 'return',
+    'declare', 'cursor', 'open', 'close', 'fetch', 'next', 'while',
+    'break', 'continue', 'goto', 'try', 'catch', 'throw', 'print',
+    'raiserror', 'table', 'view', 'procedure', 'function', 'trigger',
+    'index', 'nolock', 'rowlock', 'tablock', 'holdlock', 'readpast',
+    'output', 'inserted', 'deleted',
+}
 
 
 def extract_referenced_objects(sql_text: str) -> set[str]:
-    """Return set of object names (lower-cased) referenced in *sql_text*."""
+    """
+    Return set of object names (lower-cased) referenced in *sql_text*.
+    CTE-aware, strips strings/comments, excludes temp tables and keywords.
+    """
     if not sql_text:
         return set()
-    sql_clean = re.sub(r'--[^\n]*', ' ', sql_text)
-    sql_clean = re.sub(r'/\*.*?\*/', ' ', sql_clean, flags=re.DOTALL)
+    sql_clean = _strip_noise(sql_text)
+    cte_aliases = _extract_cte_aliases(sql_clean)
     found: set[str] = set()
     for pat in _REF_PATTERNS:
         for m in pat.finditer(sql_clean):
-            found.add(m.group(1).strip('[]').lower())
+            name = m.group(2).strip('[]').lower()
+            if name in _SQL_KEYWORDS:
+                continue
+            if name in cte_aliases:
+                continue
+            # Skip temp tables
+            if name.startswith('#'):
+                continue
+            found.add(name)
     return found
 
 
@@ -118,7 +186,7 @@ def get_catalog_objects(conn: pyodbc.Connection) -> dict[str, dict]:
     type_codes = "','".join(OBJECT_TYPE_MAP.keys())
     sql = f"""
         SELECT o.object_id, SCHEMA_NAME(o.schema_id) AS schema_name,
-               o.name, o.type
+               o.name, o.type, o.parent_object_id
         FROM   sys.objects o
         WHERE  o.type IN ('{type_codes}')
           AND  o.is_ms_shipped = 0
@@ -128,30 +196,61 @@ def get_catalog_objects(conn: pyodbc.Connection) -> dict[str, dict]:
     cur.execute(sql)
     result: dict[str, dict] = {}
     for row in cur.fetchall():
-        obj_id, schema, name, type_code = row
+        obj_id, schema, name, type_code, parent_id = row
         type_code = type_code.strip()
         key = name.lower()
         result[key] = {
             'object_id': obj_id,
             'schema': schema,
-            'name': name,           # original casing
+            'name': name,
             'type_code': type_code,
             'type_label': OBJECT_TYPE_MAP.get(type_code, type_code),
+            'parent_object_id': parent_id,
         }
     log.info("Found %d catalog objects", len(result))
+    for label in set(OBJECT_TYPE_MAP.values()):
+        cnt = sum(1 for v in result.values() if v['type_label'] == label)
+        if cnt:
+            log.info("  %s: %d", label, cnt)
     return result
+
+
+def get_trigger_parents(conn: pyodbc.Connection, catalog: dict) -> dict[str, str]:
+    """
+    Return {trigger_name_lower: parent_table_name_lower} for all triggers.
+    Triggers fire when their parent table is touched, so if a table is referenced,
+    its triggers are implicitly referenced too.
+    """
+    trigger_parents: dict[str, str] = {}
+    # Build object_id → name map
+    id_to_name: dict[int, str] = {}
+    for name, info in catalog.items():
+        id_to_name[info['object_id']] = name
+    for name, info in catalog.items():
+        if info['type_code'].strip() == 'TR' and info['parent_object_id']:
+            parent_name = id_to_name.get(info['parent_object_id'])
+            if parent_name:
+                trigger_parents[name] = parent_name
+    return trigger_parents
 
 
 def get_dependency_graph(conn: pyodbc.Connection, catalog: dict) -> dict[str, set[str]]:
     """
     Use sys.sql_expression_dependencies to build a dependency graph.
+    This is the SERVER-SIDE dependency resolver — much more reliable than
+    text parsing for SQL Server.
+
     Returns {object_name_lower: {referenced_object_lower, ...}}.
     """
     sql = """
         SELECT OBJECT_NAME(d.referencing_id) AS referencing,
-               d.referenced_entity_name       AS referenced
+               COALESCE(
+                   OBJECT_NAME(d.referenced_id),
+                   d.referenced_entity_name
+               ) AS referenced
         FROM   sys.sql_expression_dependencies d
         WHERE  d.referenced_entity_name IS NOT NULL
+           OR  d.referenced_id IS NOT NULL
     """
     cur = conn.cursor()
     cur.execute(sql)
@@ -162,7 +261,8 @@ def get_dependency_graph(conn: pyodbc.Connection, catalog: dict) -> dict[str, se
         referenced = row.referenced.lower() if row.referenced else None
         if referencing and referenced and referencing in catalog_keys and referenced in catalog_keys:
             deps[referencing].add(referenced)
-    log.info("Built dependency graph with %d entries", len(deps))
+    log.info("Built dependency graph with %d entries (from sys.sql_expression_dependencies)",
+             len(deps))
     return dict(deps)
 
 
@@ -187,6 +287,25 @@ def walk_indirect_refs(deps: dict[str, set[str]]) -> dict[str, set[str]]:
     for obj in deps:
         _resolve(obj, set())
     return resolved
+
+
+def check_query_store_enabled(conn: pyodbc.Connection) -> bool:
+    """Check if Query Store is enabled on this database."""
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT actual_state_desc
+            FROM   sys.database_query_store_options
+        """)
+        row = cur.fetchone()
+        if row and row[0] in ('READ_WRITE', 'READ_ONLY'):
+            log.info("Query Store state: %s", row[0])
+            return True
+        log.warning("Query Store state: %s", row[0] if row else 'NOT FOUND')
+        return False
+    except Exception as exc:
+        log.warning("Could not check Query Store status: %s", exc)
+        return False
 
 
 def fetch_query_store_refs(
@@ -251,10 +370,8 @@ def removal_sql(schema: str, name: str, type_label: str) -> str:
         case 'TRIGGER':
             return f"DROP TRIGGER IF EXISTS {fqn};"
         case 'SERVICE QUEUE':
-            # Queues are part of Service Broker – require special handling
             return f"-- Service Broker queue: ALTER QUEUE {fqn} (STATUS = OFF); -- review before dropping"
         case _:
-            # Functions (scalar, table-valued, aggregate)
             return f"DROP FUNCTION IF EXISTS {fqn};"
 
 
@@ -272,9 +389,17 @@ def analyse(
     port: int,
     lookback_days: int,
     output_path: str,
+    verbose: bool,
 ):
     conn = connect(server, database, username, password, driver, trusted, port)
     log.info("Connected to %s / %s", server, database)
+
+    # 0. Verify Query Store
+    if not check_query_store_enabled(conn):
+        log.error("Query Store is not enabled on this database. Enable it with:")
+        log.error("  ALTER DATABASE [%s] SET QUERY_STORE = ON;", database)
+        conn.close()
+        sys.exit(1)
 
     # 1. Catalog objects
     catalog = get_catalog_objects(conn)
@@ -283,16 +408,31 @@ def analyse(
         conn.close()
         return
 
-    # 2. Dependency graph (sys.sql_expression_dependencies)
+    # 2. Dependency graph (sys.sql_expression_dependencies) — server-side, reliable
     deps_direct = get_dependency_graph(conn, catalog)
     deps_all = walk_indirect_refs(deps_direct)
+
+    if verbose:
+        for obj_name, deps in sorted(deps_all.items()):
+            log.info("  %-40s depends on: %s", obj_name, ', '.join(sorted(deps)))
+
+    # 2b. Trigger → parent table mapping
+    trigger_parents = get_trigger_parents(conn, catalog)
+    if trigger_parents:
+        log.info("Found %d triggers with parent tables", len(trigger_parents))
 
     # 3. Query Store references
     since = datetime.now() - timedelta(days=lookback_days)
     direct_refs = fetch_query_store_refs(conn, catalog, since)
 
-    # 4. Indirect references – if object A was queried directly and A depends
-    #    on B (transitively), then B has an indirect reference via A.
+    # 3b. If a table is directly referenced, its triggers are indirectly referenced
+    trigger_indirect: dict[str, list[tuple[str, datetime]]] = defaultdict(list)
+    for trig_name, parent_name in trigger_parents.items():
+        if parent_name in direct_refs:
+            latest_dt = max(dt for _, dt in direct_refs[parent_name])
+            trigger_indirect[trig_name].append((parent_name, latest_dt))
+
+    # 4. Indirect references via dependency chain
     indirect_refs: dict[str, list[tuple[str, datetime]]] = defaultdict(list)
     for obj_name, all_deps in deps_all.items():
         if obj_name not in direct_refs:
@@ -301,6 +441,12 @@ def analyse(
         for dep in all_deps:
             if dep != obj_name:
                 indirect_refs[dep].append((obj_name, latest_dt))
+
+    # Merge trigger-parent indirect refs
+    for trig_name, refs in trigger_indirect.items():
+        indirect_refs[trig_name].extend(refs)
+
+    log.info("Indirect references found for %d objects", len(indirect_refs))
 
     # 5. Build CSV rows
     rows: list[dict] = []
@@ -389,7 +535,12 @@ def main():
                         help='Number of days to look back (default: 90)')
     parser.add_argument('--output', '-o', default='sqlserver_audit_report.csv',
                         help='Output CSV path (default: sqlserver_audit_report.csv)')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                        help='Show per-object dependency detail')
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     analyse(
         server=args.server,
@@ -401,6 +552,7 @@ def main():
         port=args.port,
         lookback_days=args.lookback_days,
         output_path=args.output,
+        verbose=args.verbose,
     )
 
 
