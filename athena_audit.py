@@ -214,23 +214,32 @@ def extract_referenced_objects(
 # Glue / Athena helpers
 # ---------------------------------------------------------------------------
 
-def get_catalog_objects(glue_client, database: str) -> dict[str, str]:
-    """Return {object_name_lower: object_type} from the Glue catalog."""
+def get_catalog_objects(glue_client, database: str) -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Return (objects, s3_locations) where:
+      objects       = {object_name_lower: object_type}
+      s3_locations  = {table_name_lower: 's3://bucket/prefix/'}
+    """
     objects: dict[str, str] = {}
+    s3_locations: dict[str, str] = {}
     paginator = glue_client.get_paginator('get_tables')
     for page in paginator.paginate(DatabaseName=database):
         for tbl in page.get('TableList', []):
             name = tbl['Name'].lower()
-            # Glue marks views with TableType='VIRTUAL_VIEW'
             if tbl.get('TableType', '').upper() == 'VIRTUAL_VIEW':
                 objects[name] = 'VIEW'
             else:
                 objects[name] = 'TABLE'
-    log.info("Found %d catalog objects in database '%s'  (%d views, %d tables)",
+                # Capture S3 location for tables
+                loc = (tbl.get('StorageDescriptor', {}) or {}).get('Location', '')
+                if loc and loc.startswith('s3://'):
+                    s3_locations[name] = loc
+    log.info("Found %d catalog objects in database '%s'  (%d views, %d tables, %d with S3 locations)",
              len(objects), database,
              sum(1 for t in objects.values() if t == 'VIEW'),
-             sum(1 for t in objects.values() if t == 'TABLE'))
-    return objects
+             sum(1 for t in objects.values() if t == 'TABLE'),
+             len(s3_locations))
+    return objects, s3_locations
 
 
 def get_view_sql(glue_client, database: str, view_name: str) -> str:
@@ -443,16 +452,73 @@ def fetch_query_executions(
                 continue
             for qe in resp.get('QueryExecutions', []):
                 status = qe.get('Status', {})
-                if status.get('State') != 'SUCCEEDED':
+                state = status.get('State', '')
+                # Include SUCCEEDED and FAILED — a failed query still
+                # proves the object is being actively referenced
+                if state not in ('SUCCEEDED', 'FAILED'):
                     continue
-                completion = status.get('CompletionDateTime')
+                completion = (status.get('CompletionDateTime')
+                              or status.get('SubmissionDateTime'))
                 if completion and completion >= since:
                     all_results.append(qe)
             # Pace batch calls
             time.sleep(0.2)
 
-    log.info("Total: %d succeeded executions within lookback window", len(all_results))
+    log.info("Total: %d completed executions (succeeded+failed) within lookback window",
+             len(all_results))
     return all_results
+
+
+def check_s3_activity(
+    s3_client,
+    s3_locations: dict[str, str],
+    table_names: set[str],
+    since: datetime,
+) -> dict[str, datetime]:
+    """
+    For each table in *table_names* that has an S3 location, check if any
+    objects were created/modified in that location since *since*.
+
+    Returns {table_name: latest_s3_modified_datetime} for tables with activity.
+    """
+    active: dict[str, datetime] = {}
+    tables_to_check = table_names & set(s3_locations.keys())
+    if not tables_to_check:
+        return active
+
+    log.info("Checking S3 activity for %d unused tables...", len(tables_to_check))
+
+    for tbl_name in sorted(tables_to_check):
+        s3_uri = s3_locations[tbl_name]
+        # Parse s3://bucket/prefix
+        parts = s3_uri.replace('s3://', '').split('/', 1)
+        bucket = parts[0]
+        prefix = parts[1] if len(parts) > 1 else ''
+        # Ensure prefix ends with / if non-empty
+        if prefix and not prefix.endswith('/'):
+            prefix += '/'
+
+        try:
+            latest_modified = None
+            paginator = s3_client.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix, MaxKeys=100):
+                for obj in page.get('Contents', []):
+                    modified = obj.get('LastModified')
+                    if modified and modified >= since:
+                        if latest_modified is None or modified > latest_modified:
+                            latest_modified = modified
+                # Only check first page of objects — enough to detect activity
+                break
+
+            if latest_modified:
+                active[tbl_name] = latest_modified
+                log.info("  TABLE %-40s  S3 activity detected (latest: %s)",
+                         tbl_name, latest_modified.isoformat())
+        except Exception as exc:
+            log.debug("  Could not check S3 for '%s' (%s): %s", tbl_name, s3_uri, exc)
+
+    log.info("S3 activity found for %d/%d unused tables", len(active), len(tables_to_check))
+    return active
 
 
 def list_workgroups(athena_client) -> list[str]:
@@ -481,6 +547,7 @@ def analyse(
     profile: str | None,
     output_path: str,
     verbose: bool,
+    skip_s3_check: bool = False,
 ):
     session_kwargs: dict = {'region_name': region}
     if profile:
@@ -493,9 +560,10 @@ def analyse(
     )
     glue = session.client('glue', config=retry_config)
     athena = session.client('athena', config=retry_config)
+    s3 = session.client('s3', config=retry_config)
 
     # 1. Catalog objects
-    catalog = get_catalog_objects(glue, database)
+    catalog, s3_locations = get_catalog_objects(glue, database)
     if not catalog:
         log.warning("No objects found in database '%s'. Exiting.", database)
         return
@@ -559,11 +627,20 @@ def analyse(
 
     log.info("Indirect references found for %d objects via view chains", len(indirect_refs))
 
-    # 7. Identify unused objects and compute drop order
+    # 7. Identify unused objects
     unused_objects: set[str] = set()
     for obj_name in catalog:
         if obj_name not in direct_refs and obj_name not in indirect_refs:
             unused_objects.add(obj_name)
+
+    # 7b. S3 activity check — exclude tables with recent S3 writes
+    s3_active: dict[str, datetime] = {}
+    if not skip_s3_check and s3_locations:
+        s3_active = check_s3_activity(s3, s3_locations, unused_objects, since)
+        # Move S3-active tables from unused → they get a special "s3_activity" ref
+        for tbl_name, s3_dt in s3_active.items():
+            unused_objects.discard(tbl_name)
+            indirect_refs[tbl_name].append(('s3_data_written', s3_dt))
 
     # Build dependency sub-graph among unused objects only
     # (we only care about ordering drops for things we're actually dropping)
@@ -660,8 +737,10 @@ def analyse(
     unused = sum(1 for r in rows if r['RemovalSql'])
     direct = sum(1 for r in rows if r['referencetype'] == 'direct')
     indirect = sum(1 for r in rows if r['referencetype'] == 'indirect')
-    log.info("Summary: %d direct, %d indirect, %d unused (safe to drop)",
-             direct, indirect, unused)
+    s3_protected = len(s3_active)
+    log.info("Summary: %d direct, %d indirect, %d unused (safe to drop), "
+             "%d protected by S3 activity",
+             direct, indirect, unused, s3_protected)
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +765,8 @@ def main():
                         help='Scan ALL workgroups in the account')
     parser.add_argument('--profile', '-p', default=None,
                         help='AWS CLI profile name (optional)')
+    parser.add_argument('--skip-s3-check', action='store_true',
+                        help='Skip S3 activity check for unused tables')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Show per-view parsing detail for debugging')
     args = parser.parse_args()
@@ -704,6 +785,7 @@ def main():
         profile=args.profile,
         output_path=args.output,
         verbose=args.verbose,
+        skip_s3_check=args.skip_s3_check,
     )
 
 
