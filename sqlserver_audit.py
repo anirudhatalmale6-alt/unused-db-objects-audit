@@ -350,6 +350,106 @@ def fetch_query_store_refs(
 
     log.info("Scanned %d Query Store entries, found references for %d objects",
              row_count, len(refs))
+
+    # ---- Additional: Query Store object_id matching ----
+    # When SPs are called externally (Python/Java/ODBC), the query text may
+    # show as just the SP body, but query_store_query.object_id links to the SP.
+    qs_obj_sql = """
+        SELECT q.object_id,
+               CAST(MAX(rs.last_execution_time) AS datetime2) AS last_exec
+        FROM   sys.query_store_query q
+        JOIN   sys.query_store_plan p   ON q.query_id = p.query_id
+        JOIN   sys.query_store_runtime_stats rs ON p.plan_id = rs.plan_id
+        WHERE  q.object_id > 0
+          AND  CAST(rs.last_execution_time AS datetime2) >= ?
+        GROUP  BY q.object_id
+    """
+    try:
+        cur2 = conn.cursor()
+        cur2.execute(qs_obj_sql, since)
+        qs_obj_count = 0
+        for row in cur2.fetchall():
+            obj_id, last_exec = row
+            for oname, info in catalog.items():
+                if info['object_id'] == obj_id and oname not in refs:
+                    refs[oname] = [(f"qs_object_id:{obj_id}", last_exec)]
+                    qs_obj_count += 1
+        if qs_obj_count:
+            log.info("Query Store object_id matching found %d additional SPs/functions",
+                     qs_obj_count)
+    except Exception as exc:
+        log.debug("Query Store object_id check failed: %s", exc)
+
+    return dict(refs)
+
+
+def fetch_procedure_stats(
+    conn: pyodbc.Connection,
+    catalog: dict[str, dict],
+    since: datetime,
+) -> dict[str, list[tuple[str, datetime]]]:
+    """
+    Use sys.dm_exec_procedure_stats to find stored procedures that were
+    executed recently.  This DMV captures ALL SP executions — including
+    those called from external code (Python, Java, .NET) via ODBC/JDBC
+    which Query Store text parsing may miss.
+
+    Returns {object_name_lower: [('dm_exec_procedure_stats', last_execution_time)]}.
+    """
+    sql = """
+        SELECT ps.object_id,
+               OBJECT_NAME(ps.object_id) AS proc_name,
+               CAST(ps.last_execution_time AS datetime2) AS last_exec
+        FROM   sys.dm_exec_procedure_stats ps
+        WHERE  ps.database_id = DB_ID()
+          AND  CAST(ps.last_execution_time AS datetime2) >= ?
+    """
+    refs: dict[str, list[tuple[str, datetime]]] = defaultdict(list)
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, since)
+        for row in cur.fetchall():
+            obj_id, proc_name, last_exec = row
+            if proc_name:
+                key = proc_name.lower()
+                if key in catalog:
+                    refs[key].append(('dm_exec_procedure_stats', last_exec))
+        log.info("dm_exec_procedure_stats: found %d recently executed procedures", len(refs))
+    except Exception as exc:
+        log.warning("Could not query dm_exec_procedure_stats: %s", exc)
+    return dict(refs)
+
+
+def fetch_trigger_stats(
+    conn: pyodbc.Connection,
+    catalog: dict[str, dict],
+    since: datetime,
+) -> dict[str, list[tuple[str, datetime]]]:
+    """
+    Use sys.dm_exec_trigger_stats to find triggers that fired recently.
+
+    Returns {object_name_lower: [('dm_exec_trigger_stats', last_execution_time)]}.
+    """
+    sql = """
+        SELECT OBJECT_NAME(ts.object_id) AS trigger_name,
+               CAST(ts.last_execution_time AS datetime2) AS last_exec
+        FROM   sys.dm_exec_trigger_stats ts
+        WHERE  ts.database_id = DB_ID()
+          AND  CAST(ts.last_execution_time AS datetime2) >= ?
+    """
+    refs: dict[str, list[tuple[str, datetime]]] = defaultdict(list)
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, since)
+        for row in cur.fetchall():
+            trigger_name, last_exec = row
+            if trigger_name:
+                key = trigger_name.lower()
+                if key in catalog:
+                    refs[key].append(('dm_exec_trigger_stats', last_exec))
+        log.info("dm_exec_trigger_stats: found %d recently fired triggers", len(refs))
+    except Exception as exc:
+        log.debug("Could not query dm_exec_trigger_stats: %s", exc)
     return dict(refs)
 
 
@@ -425,7 +525,28 @@ def analyse(
     since = datetime.now() - timedelta(days=lookback_days)
     direct_refs = fetch_query_store_refs(conn, catalog, since)
 
-    # 3b. If a table is directly referenced, its triggers are indirectly referenced
+    # 3b. dm_exec_procedure_stats — catches SPs called from external code
+    #     (Python, Java, .NET via ODBC/JDBC) that Query Store text may miss
+    proc_stats = fetch_procedure_stats(conn, catalog, since)
+    for oname, ref_list in proc_stats.items():
+        if oname not in direct_refs:
+            direct_refs[oname] = ref_list
+        else:
+            # Keep the latest timestamp
+            existing_latest = max(dt for _, dt in direct_refs[oname])
+            new_latest = max(dt for _, dt in ref_list)
+            if new_latest > existing_latest:
+                direct_refs[oname].extend(ref_list)
+
+    # 3c. dm_exec_trigger_stats — catches triggers that fired
+    trig_stats = fetch_trigger_stats(conn, catalog, since)
+    for oname, ref_list in trig_stats.items():
+        if oname not in direct_refs:
+            direct_refs[oname] = ref_list
+        else:
+            direct_refs[oname].extend(ref_list)
+
+    # 3d. If a table is directly referenced, its triggers are indirectly referenced
     trigger_indirect: dict[str, list[tuple[str, datetime]]] = defaultdict(list)
     for trig_name, parent_name in trigger_parents.items():
         if parent_name in direct_refs:
